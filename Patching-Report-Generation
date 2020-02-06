@@ -1,0 +1,190 @@
+import boto3
+import json
+import time
+import datetime                             
+from StringIO import StringIO 
+import ast
+import os
+from email import encoders
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
+
+date_fmt = datetime.datetime.now().strftime("%d-%m-%Y")
+key = 'PatchingReport'+ '_' + str(date_fmt) + '.html'
+
+#############################################CHANGE#################################################
+fromAddress = os.environ['SenderAddress']
+toAddress = os.environ['ReceiverAddress']
+bucketName = os.environ['s3BucketName']
+regionName = os.environ['DeploymentRegion']
+attach = '/tmp/'+ key
+####################################################################################################
+
+client = boto3.client('ssm')
+s3Client = boto3.client('s3')
+ec2client=boto3.client('ec2')
+ses = boto3.client('ses',region_name=regionName)
+s3 = boto3.resource('s3')
+
+#############################################CHANGE#################################################
+def mail(fromAddress,toAddress, subject, text, attach):
+    
+    #Multiple recipients could be there
+    ###################################################################
+    if(toAddress.find(',') > 1) :
+        toAddress = toAddress.split(',')
+    else :
+        toAddress = list(toAddress.split())
+    ###################################################################
+    
+    CHARSET = "UTF-8"
+    msg = MIMEMultipart('alternative')
+    msg['From'] = fromAddress
+    msg['To'] = ','.join(toAddress)
+    msg['Subject'] = subject
+    text = MIMEText(text.encode(CHARSET), 'html', CHARSET)
+    msg.attach(text)
+    if attach != None :
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(open(attach, 'rb').read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition','attachment; filename="%s"' % os.path.basename(attach))
+        msg.attach(part)
+    try:
+        response = ses.send_raw_email(
+            Source=fromAddress,
+            Destinations=toAddress,
+            RawMessage={
+                'Data':msg.as_string(),
+            },
+        )   
+    except Exception as e:
+        print "Some Error has occured stating " + str(e)
+    else:
+        print "Email sent! Message ID: %s" % response['MessageId']
+###############################################################################################
+
+def lambda_handler(event, context):
+    
+    cmd_id=list()
+    #time.sleep(6)
+    #print event
+    eventnew1=json.dumps(event)
+    eventnew=json.loads(eventnew1)
+    print eventnew
+    
+    #print dec
+    
+    #print eventnew
+    output=list()
+    try:
+        reclen=len(eventnew['Records'])
+    except Exception as e:
+        print str(e)
+    print "Total Records = "+ str(reclen)
+    for i in range(reclen):
+        try:
+            cmd_id.append(eventnew['Records'][i]['Sns']['Message']['commandId'])
+            try:
+                output.append(event['Records'][i]['Sns']['Message']['outputS3BucketName'])
+            except Exception as e:
+                output.append("cmsssm")                                     #change needed
+        except Exception as e:
+            
+            datas= ast.literal_eval(eventnew['Records'][i]['Sns']['Message'])#json.dumps(eventnew['Records'][i]['Sns']['Message'], ensure_ascii=False).encode('utf8'))
+            #datas = ast.literal_eval(json.dumps(event['Records'][i]['Sns']['Message'], ensure_ascii=False).encode('utf8'))
+            cmd_id.append(datas['commandId'])
+            try:
+                output.append(datas['outputS3BucketName'])
+            except Exception as e:
+                output.append("cmsssm")                                     #change needed
+            print cmd_id
+          
+    cmdlen=len(cmd_id)
+    print "Total Command ID : " + str(cmdlen)
+    insid=list()
+    res=''
+    for j in range(cmdlen):
+        try:
+            id=str(cmd_id[j])
+            response = client.list_command_invocations(
+                   CommandId=id,
+                   
+                   #PluginName='string'
+                          )
+            cmdins=len(response['CommandInvocations'])
+            print "Total invocation : "+ str(cmdins)
+            
+            for i in range(cmdins):
+                
+                insid=str(response['CommandInvocations'][i]['InstanceId'] )
+                
+                instancedet = ec2client.describe_instances(
+                        InstanceIds=[insid]
+                    ).get(
+                        'Reservations', []
+                    )
+                instance_name=''
+                instances = sum(
+                        [
+                            [i for i in r['Instances']]
+                            for r in instancedet
+                        ], [])
+                #print instancedet
+                try:
+                    pvtipaddr=instancedet[0]['Instances'][0]['PrivateIpAddress']
+                except Exception as e:
+                    pvtipaddr = 'None'
+                try:
+                    pubip=instancedet[0]['Instances'][0]['PublicIpAddress']
+                except Exception as e:
+                    pubip = 'none'
+                print pvtipaddr,pubip
+                for instance in instances:
+                    try:
+                        instance_name=[
+                            str(t.get('Value')) for t in instance['Tags']
+                            if t['Key'] == 'name' or t['Key'] == 'Name' or t['Key'] == 'NAME'][0]
+                    except Exception as e:
+                        instance_name = 'None'  
+                print instance_name
+                tmp = "\r\nReport For Instance Name: " + str(instance_name) + " Private IP: " + str(pvtipaddr) + " Public IP: " + str(pubip) + "\r\n\r\n"
+                tmp=tmp+get_out(insid,str(output[j]),id)
+                
+                res=res+tmp +"\r\n"
+                
+        except Exception as e:
+            print str(e)
+            pass
+    print res 
+    buf=StringIO()
+    buf.write(res)
+    buf.seek(0)
+    s3Client.upload_fileobj(buf, 'cmsssm', key)                             #change needed
+    sns = boto3.client('sns')
+    
+    
+    #####################################################################################
+    #Send email to the customer
+    subject = 'Patching Report | ' + str(date_fmt)
+    text = """
+    <!DOCTYPE html>
+    <html lang="en">
+        <head>
+            <meta charset="utf-8">
+        </head>
+        <br>
+        <body>
+            <h2 align='center'> Server Patching Report </h2>
+            <p>Here is the consolidated AWS Server Patching Report</p>
+            <p><b>***This is a auto generated Email. Do not reply to this email***</b></p>
+            <p>Thanks</p>
+        </body>
+    </html>
+    """
+    s3.Bucket(bucketName).download_file(key, attach)
+    mail(fromAddress,toAddress, subject, text, attach)
+    
+    #####################################################################################
